@@ -1,0 +1,243 @@
+# Load the required libraries
+library(RPostgreSQL)
+library(sqldf)
+
+# Database connection parameters for the first database
+db_params1 <- list(
+  dbname="vaaree_oms_db",
+  user="read_only",
+  password="ck5dy9ijby1z@321",
+  host="vaaree-prod-read-replica.ck5dy9ijby1z.ap-south-1.rds.amazonaws.com",
+  port=5432
+)
+
+# Database connection parameters for the second database
+db_params2 <- list(
+  dbname = "analytics",
+  user = "analysts",
+  password = "ck5dy9ijby1z",
+  host = "prod-analytics-db.ck5dy9ijby1z.ap-south-1.rds.amazonaws.com",
+  port = 5432
+)
+
+# Connect to the first PostgreSQL database
+conn1 <- dbConnect(RPostgres::Postgres(),
+                   dbname = db_params1$dbname,
+                   user = db_params1$user,
+                   password = db_params1$password,
+                   host = db_params1$host,
+                   port = db_params1$port)
+
+# Connect to the second PostgreSQL database
+conn2 <- dbConnect(RPostgres::Postgres(),
+                   dbname = db_params2$dbname,
+                   user = db_params2$user,
+                   password = db_params2$password,
+                   host = db_params2$host,
+                   port = db_params2$port)
+
+# Function to run a custom SQL query and return the result as a data frame
+run_custom_query_as_df <- function(conn, custom_query) {
+  return(dbGetQuery(conn, custom_query))
+}
+
+# Function to retrieve a table from a database as a data frame
+get_table_as_df <- function(conn, table_name) {
+  query <- paste("SELECT * FROM", table_name)
+  return(dbGetQuery(conn, query))
+}
+
+calendar <- get_table_as_df(conn2, "calendar_h")
+
+# Custom SQL query
+custom_query <- "   SELECT TO_CHAR(o.created_at + INTERVAL '330 minutes', 'YYYY-MM') AS order_mnt,
+                           TO_CHAR(o.created_at + INTERVAL '330 minutes', 'YYYY-MM-DD') AS order_dt,
+                           TO_CHAR(sp.dispatched_at + INTERVAL '330 minutes', 'YYYY-MM-DD') AS dispatch_dt,
+                           o.order_number as order_no,
+                           s.display_name,
+                           sp.tracking_number,
+                           r.manufacturer_mistake,
+                           r.reason as return_reason,
+                           case when o.status = 'cancelled' then 'cancelled'
+                    		        when r.shipment_tracking_status ='RETURNED_TO_ORIGIN' then 'rto'
+                    		        when ri.order_item_id is not null then 'return'
+                    		        when upper(sp.courier_status) in ('DISPATCHED','DELIVERED','DL-SHIPMENT DELIVERED') then 'delivered'
+                    		        else o.status end as order_status,
+                    		   sum((oi.variant_price * oi.quantity)) as lp,
+                    		   sum((oi.variant_inventory_cost_price * oi.quantity)) as cp
+                    	FROM order_items as oi
+                    	JOIN orders as o
+                        ON oi.order_id = o.id
+                    	 AND o.deleted_at IS NULL 
+                 LEFT JOIN product_variants as pv
+                    	  ON oi.product_variant_id = pv.id
+                       AND pv.deleted_at IS NULL
+                 LEFT JOIN products as p
+                        ON pv.product_id = p.id
+                   	   AND p.deleted_at IS NULL
+                 LEFT JOIN return_items as ri
+                        ON ri.order_item_id = oi.id
+                 LEFT JOIN returns as r
+                        ON ri.return_id = r.id
+                 LEFT JOIN shipping_order_items as soi
+                        ON soi.order_item_id = oi.id
+                 LEFT JOIN shipping_packages as sp
+                        ON sp.id = soi.shipping_package_id
+                 LEFT JOIN suppliers s ON p.supplier_id = s.id
+                       AND s.deleted_at IS NULL
+                     WHERE TO_CHAR(o.created_at + INTERVAL '330 minutes', 'YYYY-MM') = '2023-10'
+                  GROUP BY 1,2,3,4,5,6,7,8,9"
+
+
+# Run the custom query and get the result as a data frame
+sales <- run_custom_query_as_df(conn1, custom_query)
+
+sales$manufacturer_mistake <- ifelse(sales$manufacturer_mistake, "Yes", "No")
+
+
+temp <- sqldf("select t1.tracking_number,
+                      count(distinct t2.dt) as days_to_dispatch
+                 from sales as t1
+                 join calendar as t2
+                   on t2.dt >= t1.order_dt
+                  and t2.dt <= t1.dispatch_dt
+                  and t2.holiday_flag = 0 and t2.day !=7
+             group by 1",drv="SQLite")
+
+
+temp <- sqldf("select t1.order_mnt,
+                      t1.display_name,
+                      count(distinct t1.tracking_number) as shipments,
+                      avg(t2.days_to_dispatch) as avg_days_to_dispatch
+                 from sales as t1
+            left join temp as t2
+                   on t1.tracking_number = t2.tracking_number
+             group by 1,2",drv="SQLite")
+
+
+sales <- sqldf("select order_mnt,
+                       display_name,
+                       count(distinct case when manufacturer_mistake = 'Yes' and return_reason = 'Received damaged products' then order_no end) as defective_returns,
+                       count(distinct case when manufacturer_mistake = 'Yes' and return_reason = 'Received wrong or incorrect products' then order_no end) as wrong_dispatch,
+                       count(distinct case when order_status = 'return' and manufacturer_mistake != 'Yes' then order_no end) as customer_returns,
+                       count(distinct case when order_status = 'return'  then order_no end) as total_returns,
+                       count(distinct case when order_status = 'rto'  then order_no end) as total_rtos,
+                       count(distinct order_no) as total_orders,
+                       sum(lp) as lp,
+                       sum(cp) as cp
+                from sales
+                group by 1,2",drv="SQLite")
+
+#Rating and SKU counts
+custom_query <- "   SELECT s.display_name,
+                           count(*) as no_of_rating,
+                           sum(rating) as total_rating
+                    	FROM product_variants as pv
+                 LEFT JOIN products as p
+                        ON pv.product_id = p.id
+                 LEFT JOIN suppliers s 
+                        ON p.supplier_id = s.id
+                      JOIN product_reviews as pr
+                        on pr.product_id = p.id
+                  GROUP BY 1"
+
+reviews <- run_custom_query_as_df(conn1, custom_query)
+
+reviews$no_of_rating <- as.numeric(reviews$no_of_rating)
+reviews$total_rating <- as.numeric(reviews$total_rating)
+
+custom_query <- "   SELECT s.display_name,
+                           count(distinct pv.sku) as tot_skus,
+                           count(distinct case when inventory_quantity>0 then pv.sku end) as is_skus,
+                           avg(inventory_quantity) as avg_stock
+                    	FROM product_variants as pv
+                 LEFT JOIN products as p
+                        ON pv.product_id = p.id
+                 LEFT JOIN suppliers s 
+                        ON p.supplier_id = s.id
+                     WHERE p.published_at is not null
+                  GROUP BY 1"
+
+items <- run_custom_query_as_df(conn1, custom_query)
+items$tot_skus <- as.numeric(items$tot_skus)
+items$is_skus <- as.numeric(items$is_skus)
+
+#write.table(sales, "clipboard-131072",na="", sep="\t", col.names=TRUE,row.names = FALSE)
+ft <- sqldf("select display_name from temp group by 1
+             union 
+             select display_name from items group by 1
+             union 
+             select display_name from reviews group by 1
+             union 
+             select display_name from sales group by 1",drv="SQLite")
+
+final <- sqldf("select ft.display_name,
+                       t2.avg_stock,
+                       t1.total_orders,
+                       t3.avg_days_to_dispatch,
+                       1-t4.is_skus*1.0/t4.tot_skus*1.0 as oos_perc,
+                       t1.total_returns*1.0/t1.total_orders*1.0 as return_perc,
+                       no_of_rating,
+                       lp,
+                       t4.tot_skus,
+                       1 - cp/lp as take_rate,
+                       case when t4.tot_skus <50 then 0
+                             when t4.tot_skus <100 then 1
+                             when t4.tot_skus >=100 then 2
+                             else 0
+                        end as SKUCountScore,
+                        case when t2.avg_stock <10 then 0
+                             when t2.avg_stock <50 then 1
+                             when t2.avg_stock >=50 then 2
+                             else 0
+                        end as InvtScore,
+                        case when t1.total_orders <20 then 0
+                             when t1.total_orders <50 then 1
+                             when t1.total_orders <200 then 2
+                             when t1.total_orders >=200 then 3
+                             else 0
+                        end as OrderScore,
+                        case when t3.avg_days_to_dispatch <=1 then 2
+                             when t3.avg_days_to_dispatch <=2 then 1
+                             when t3.avg_days_to_dispatch >2 then 0
+                             else 0
+                        end as DispScore,
+                        case when 1-t4.is_skus*1.0/t4.tot_skus*1.0 <0.05 then 2
+                             when 1-t4.is_skus*1.0/t4.tot_skus*1.0 <0.25 then 1
+                             when 1-t4.is_skus*1.0/t4.tot_skus*1.0 >=0.25 then 0
+                             else 0
+                        end as OOSScore,
+                        case when (t1.defective_returns + t1.wrong_dispatch)*1.0/t1.total_orders*1.0 <0.05 then 2
+                             when (t1.defective_returns + t1.wrong_dispatch)*1.0/t1.total_orders*1.0 <0.1 then 1
+                             when (t1.defective_returns + t1.wrong_dispatch)*1.0/t1.total_orders*1.0 >=0.1 then 0
+                             else 0
+                        end as RetScore,
+                        case when t5.total_rating/t5.no_of_rating <3 then 0
+                             when t5.total_rating/t5.no_of_rating <=4 then 1
+                             when t5.total_rating/t5.no_of_rating >4 then 2
+                             else 0
+                        end as RatScore
+                from ft
+                left join sales as t1
+                       on ft.display_name = t1.display_name
+                left join items as t2
+                       on ft.display_name = t2.display_name
+                left join temp as t3
+                       on ft.display_name = t3.display_name
+                left join items as t4
+                       on ft.display_name = t4.display_name
+                left join reviews as t5
+                       on ft.display_name = t5.display_name
+                where t1.total_orders>0",drv="SQLite")
+
+
+# Close the database connections
+dbDisconnect(conn1)
+dbDisconnect(conn2)
+
+write.table(final, "clipboard-131072",na="", sep="\t", col.names=TRUE,row.names = FALSE)
+
+# Remove all variables and data frames in the R environment
+rm(list = ls())
+
+
